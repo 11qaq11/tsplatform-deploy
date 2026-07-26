@@ -1,0 +1,8 @@
+{
+  "name": "@tsplatform/cloud-server",
+  "version": "0.0.1",
+  "private": true,
+  "dependencies": {
+    "better-sqlite3": "^11.0.0"
+  }
+}

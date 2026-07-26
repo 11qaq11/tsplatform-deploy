@@ -1,0 +1,21 @@
+version: "3.8"
+services:
+  cloud-server:
+    build: .
+    container_name: tsplatform-server
+    ports:
+      - "3000:3000"
+    environment:
+      - NODE_ENV=production
+      - API_PORT=3000
+      - API_BASE_URL=http://122.51.90.193:3000
+      - DB_PATH=/data/tsplatform.db
+      - STORAGE_PATH=/data
+      - FEISHU_APP_ID=${FEISHU_APP_ID}
+      - FEISHU_APP_SECRET=${FEISHU_APP_SECRET}
+      - ADMIN_FEISHU_OPEN_ID=${ADMIN_FEISHU_OPEN_ID}
+    volumes:
+      - tsplatform_data:/data
+    restart: unless-stopped
+volumes:
+  tsplatform_data:
