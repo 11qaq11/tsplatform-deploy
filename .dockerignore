@@ -1,0 +1,13 @@
+node_modules/
+.git/
+Dockerfile
+.dockerignore
+.env
+*.log
+*.db
+data/
+specs/
+交接文档.md
+README.md
+.idea/
+.vscode/
