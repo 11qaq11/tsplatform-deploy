@@ -13,8 +13,22 @@ services:
       - FEISHU_APP_ID=${FEISHU_APP_ID}
       - FEISHU_APP_SECRET=${FEISHU_APP_SECRET}
       - ADMIN_FEISHU_OPEN_ID=${ADMIN_FEISHU_OPEN_ID}
+      - AI_MODEL_API_KEY=${AI_MODEL_API_KEY}
     volumes:
       - tsplatform_data:/data
     restart: unless-stopped
+
+  admin-nginx:
+    image: nginx:alpine
+    container_name: tsplatform-admin
+    ports:
+      - "8080:80"
+    volumes:
+      - ./admin-dist:/usr/share/nginx/html:ro
+      - ./nginx-admin.conf:/etc/nginx/conf.d/default.conf:ro
+    depends_on:
+      - cloud-server
+    restart: unless-stopped
+
 volumes:
   tsplatform_data:

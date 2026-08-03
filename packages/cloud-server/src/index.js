@@ -97,6 +97,13 @@ db.exec(`
 
 console.log('Database initialized');
 
+// === HTML page for OAuth callback ===
+function htmlPage(title, message, success) {
+  var color = success ? '#22c55e' : '#ef4444';
+  var icon = success ? '&#10003;' : '&#10007;';
+  return '<!DOCTYPE html>\n<html lang="zh-CN">\n<head><meta charset="UTF-8"><title>' + title + '</title>\n<style>\n*{margin:0;padding:0;box-sizing:border-box}\nbody{display:flex;align-items:center;justify-content:center;min-height:100vh;font-family:-apple-system,BlinkMacSystemFont,sans-serif;background:#0a0a14;color:#fff}\n.box{text-align:center;padding:48px;max-width:420px}\n.icon{width:64px;height:64px;margin:0 auto 24px;border-radius:50%;background:' + color + ';display:flex;align-items:center;justify-content:center;font-size:32px}\nh1{font-size:22px;margin-bottom:8px}\np{color:rgba(255,255,255,0.6);font-size:14px;line-height:1.6}\n.hint{margin-top:28px;font-size:13px;color:rgba(255,255,255,0.35)}\n</style></head>\n<body><div class="box">\n<div class="icon">' + icon + '</div>\n<h1>' + title + '</h1>\n<p>' + (success ? 'User: <strong>' + message + '</strong><br>Authorization complete' : message) + '</p>\n<p class="hint">You may now close this page and return to the app</p>\n</div>\n</body></html>';
+}
+
 // === Helpers ===
 
 function parseBody(req) {
@@ -133,6 +140,9 @@ function adminAuth(req) {
 
 // === Router ===
 
+const pendingSessions = new Map();
+setInterval(() => { const now = Date.now(); for (const [key, entry] of pendingSessions) { if (now - entry.created > 300000) pendingSessions.delete(key); } }, 300000);
+
 const server = http.createServer(async (req, res) => {
   if (req.method === 'OPTIONS') {
     res.writeHead(204, {
@@ -154,54 +164,140 @@ const server = http.createServer(async (req, res) => {
       return json(res, { status: 'ok', timestamp: new Date().toISOString() });
     }
 
+        // Poll session by state (for desktop auto-login)
+    if (method === 'GET' && path === '/api/v1/auth/session/wait') {
+      const state = url.searchParams.get('state');
+      if (!state) return json(res, { status: 'error', message: 'Missing state' }, 400);
+      const entry = pendingSessions.get(state);
+      if (entry) { pendingSessions.delete(state); return json(res, entry.session); }
+      return json(res, { status: 'pending' });
+    }
+
+
+    // ========== AI Proxy (API key on server, never exposed to client) ==========
+    if (method === 'POST' && path.startsWith('/api/v1/ai/')) {
+      const aiApiKey = process.env.AI_MODEL_API_KEY || '';
+      if (!aiApiKey) return json(res, { error: { code: 'CONFIG_ERROR', message: 'AI API key not configured' } }, 500);
+
+      const targetPath = path.replace('/api/v1/ai', '');
+      const targetUrl = 'https://api.deepseek.com' + targetPath + (url.search || '');
+      const upstreamHeaders = { ...req.headers };
+      delete upstreamHeaders.host;
+      delete upstreamHeaders.connection;
+      upstreamHeaders.authorization = 'Bearer ' + aiApiKey;
+
+      try {
+        const body = await parseBody(req);
+        const upstream = await fetch(targetUrl, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + aiApiKey },
+          body: JSON.stringify(body),
+        });
+        const data = await upstream.json();
+        res.writeHead(upstream.status, {
+          'Content-Type': 'application/json',
+          'Access-Control-Allow-Origin': '*',
+        });
+        return res.end(JSON.stringify(data));
+      } catch (err) {
+        return json(res, { error: { code: 'PROXY_ERROR', message: err.message } }, 502);
+      }
+    }
+
     // ========== Auth ==========
     if (method === 'GET' && path === '/api/v1/auth/feishu/authorize') {
       const state = crypto.randomUUID();
-      const p = new URLSearchParams({ app_id: FEISHU_APP_ID, redirect_uri: FEISHU_REDIRECT_URI, state, scope: 'openid' });
-      return json(res, { redirect_url: `https://open.feishu.cn/open-apis/authen/v1/authorize?${p}`, state });
+      const redirect = url.searchParams.get('redirect');
+      if (redirect) pendingSessions.set(state, { redirect, created: Date.now() });
+      const p = new URLSearchParams({ app_id: FEISHU_APP_ID, redirect_uri: FEISHU_REDIRECT_URI, state,  });
+      return json(res, { redirect_url: `https://open.feishu.cn/open-apis/authen/v1/index?${p}`, state });
     }
 
     if (method === 'GET' && path === '/api/v1/auth/feishu/callback') {
       const code = url.searchParams.get('code');
-      if (!code) return json(res, { error: { code: 'VALIDATION_ERROR', message: 'Missing code' } }, 400);
-
-      // Exchange code for token
-      const tb = new URLSearchParams({ grant_type: 'authorization_code', client_id: FEISHU_APP_ID, client_secret: FEISHU_APP_SECRET, code, redirect_uri: FEISHU_REDIRECT_URI });
-      const tr = await fetch('https://open.feishu.cn/open-apis/authen/v1/oidc/access_token', { method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded' }, body: tb.toString() });
-      const td = await tr.json();
-      if (td.code !== 0) return json(res, { error: { code: 'UNAUTHORIZED', message: td.msg } }, 401);
-
-      // Get user info
-      const ur = await fetch('https://open.feishu.cn/open-apis/authen/v1/user_info', { headers: { Authorization: `Bearer ${td.data.access_token}` } });
-      const ud = await ur.json();
-      if (!ud.data) return json(res, { error: { code: 'UNAUTHORIZED' } }, 401);
-
-      const { open_id, union_id, name, email, avatar_url } = ud.data;
-
-      let user = db.prepare('SELECT * FROM users WHERE feishu_open_id=?').get(open_id);
-      const token = crypto.randomUUID();
-      const exp = new Date(Date.now() + 7 * 86400000).toISOString();
-
-      if (user) {
-        db.prepare("UPDATE users SET session_token=?,session_expires_at=?,last_login_at=datetime('now') WHERE id=?").run(token, exp, user.id);
-        user = db.prepare('SELECT * FROM users WHERE id=?').get(user.id);
-      } else {
-        const id = crypto.randomUUID();
-        db.prepare('INSERT INTO users (id,feishu_open_id,feishu_union_id,username,email,avatar_url,session_token,session_expires_at) VALUES (?,?,?,?,?,?,?,?)').run(id, open_id, union_id, name, email || null, avatar_url || null, token, exp);
-        user = db.prepare('SELECT * FROM users WHERE id=?').get(id);
+      const state = url.searchParams.get('state');
+      if (!code) {
+        res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+        return res.end(htmlPage('Auth Failed', 'Missing code parameter', false));
       }
 
-      return json(res, {
-        session_token: user.session_token,
-        expires_at: user.session_expires_at,
-        user: { id: user.id, username: user.username, email: user.email, avatar_url: user.avatar_url, role: user.role },
-      });
+      try {
+        const atBody = JSON.stringify({ app_id: FEISHU_APP_ID, app_secret: FEISHU_APP_SECRET });
+        const atRes = await fetch('https://open.feishu.cn/open-apis/auth/v3/app_access_token/internal', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: atBody });
+        const atData = await atRes.json();
+        if (atData.code !== 0 || !atData.app_access_token) {
+          res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+          return res.end(htmlPage('Auth Failed', atData.msg || 'Failed to get app token', false));
+        }
+
+        const tb = new URLSearchParams({ grant_type: 'authorization_code', code });
+        const tr = await fetch('https://open.feishu.cn/open-apis/authen/v1/oidc/access_token', { method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded', 'Authorization': 'Bearer ' + atData.app_access_token }, body: tb });
+        const td = await tr.json();
+        if (td.code !== 0) {
+          res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+          return res.end(htmlPage('Auth Failed', td.msg || 'Code exchange failed', false));
+        }
+
+        const ur = await fetch('https://open.feishu.cn/open-apis/authen/v1/user_info', { headers: { 'Authorization': 'Bearer ' + td.data.access_token } });
+        const ud = await ur.json();
+        if (!ud.data) {
+          res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+          return res.end(htmlPage('Auth Failed', 'Cannot get user info', false));
+        }
+
+        const open_id = ud.data.open_id;
+        const union_id = ud.data.union_id;
+        const name = ud.data.name;
+        const email = ud.data.email;
+        const avatar_url = ud.data.avatar_url;
+
+        let user = db.prepare('SELECT * FROM users WHERE feishu_open_id=?').get(open_id);
+        const token = crypto.randomUUID();
+        const exp = new Date(Date.now() + 7 * 86400000).toISOString();
+
+        if (user) {
+          db.prepare("UPDATE users SET session_token=?,session_expires_at=?,last_login_at=datetime('now') WHERE id=?").run(token, exp, user.id);
+          user = db.prepare('SELECT * FROM users WHERE id=?').get(user.id);
+        } else {
+          const id = crypto.randomUUID();
+          db.prepare('INSERT INTO users (id,feishu_open_id,feishu_union_id,username,email,avatar_url,session_token,session_expires_at) VALUES (?,?,?,?,?,?,?,?)').run(id, open_id, union_id, name, email || null, avatar_url || null, token, exp);
+          user = db.prepare('SELECT * FROM users WHERE id=?').get(id);
+        }
+
+        const session = {
+          session_token: user.session_token,
+          expires_at: user.session_expires_at,
+          user: { id: user.id, username: user.username, email: user.email, avatar_url: user.avatar_url, role: user.role },
+        };
+
+        if (state) {
+          const entry = pendingSessions.get(state);
+          if (entry && entry.redirect) {
+            pendingSessions.delete(state);
+            res.writeHead(302, { Location: `${entry.redirect}#token=${encodeURIComponent(user.session_token)}&expires_at=${encodeURIComponent(user.session_expires_at)}` });
+            return res.end();
+          }
+          pendingSessions.set(state, { session, created: Date.now() });
+        }
+
+        res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+        return res.end(htmlPage('Login Success', user.username, true));
+      } catch (err) {
+        res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+        return res.end(htmlPage('Auth Failed', err.message, false));
+      }
     }
 
     if (method === 'GET' && path === '/api/v1/auth/session') {
       const u = auth(req);
       if (!u) return json(res, { error: { code: 'UNAUTHORIZED' } }, 401);
       return json(res, { user: { id: u.id, username: u.username, email: u.email, role: u.role } });
+    }
+
+    if (method === 'POST' && path === '/api/v1/auth/logout') {
+      const u = auth(req);
+      if (u) db.prepare("UPDATE users SET session_token=NULL, session_expires_at=NULL WHERE id=?").run(u.id);
+      return json(res, { success: true });
     }
 
     // ========== Sync ==========
@@ -261,18 +357,71 @@ const server = http.createServer(async (req, res) => {
     }
 
     // ========== Admin ==========
+    const toolMatch = path.match(/^\/api\/v1\/admin\/tools\/([^/]+)$/);
+
     if (method === 'POST' && path === '/api/v1/admin/tools') {
       if (!adminAuth(req)) return json(res, { error: { code: 'UNAUTHORIZED' } }, 403);
       const body = await parseBody(req);
-      const id = crypto.randomUUID();
+      const id = body.id || crypto.randomUUID();
       db.prepare('INSERT INTO tools (id,name,description,category,version,author,manifest,storage_path) VALUES (?,?,?,?,?,?,?,?)').run(id, body.name, body.description, body.category, body.version, body.author, JSON.stringify(body.manifest || {}), body.storage_path || '');
       return json(res, { success: true, id }, 201);
     }
 
+    if (method === 'GET' && path === '/api/v1/admin/tools') {
+      if (!adminAuth(req)) return json(res, { error: { code: 'UNAUTHORIZED' } }, 403);
+      const items = db.prepare('SELECT * FROM tools ORDER BY created_at DESC').all();
+      return json(res, { items, total: items.length });
+    }
+
+    if (method === 'PUT' && toolMatch) {
+      if (!adminAuth(req)) return json(res, { error: { code: 'UNAUTHORIZED' } }, 403);
+      const id = toolMatch[1];
+      const existing = db.prepare('SELECT * FROM tools WHERE id = ?').get(id);
+      if (!existing) return json(res, { error: { code: 'NOT_FOUND', message: 'Tool not found' } }, 404);
+      const body = await parseBody(req);
+      if (body.status) db.prepare("UPDATE tools SET status = ? WHERE id = ?").run(body.status, id);
+      if (body.name) db.prepare('UPDATE tools SET name = ? WHERE id = ?').run(body.name, id);
+      if (body.description) db.prepare('UPDATE tools SET description = ? WHERE id = ?').run(body.description, id);
+      if (body.category) db.prepare('UPDATE tools SET category = ? WHERE id = ?').run(body.category, id);
+      if (body.version) db.prepare('UPDATE tools SET version = ? WHERE id = ?').run(body.version, id);
+      return json(res, { success: true });
+    }
+
+    if (method === 'DELETE' && toolMatch) {
+      if (!adminAuth(req)) return json(res, { error: { code: 'UNAUTHORIZED' } }, 403);
+      const id = toolMatch[1];
+      db.prepare("UPDATE tools SET status = 'unpublished' WHERE id = ?").run(id);
+      return json(res, { success: true });
+    }
+
+    if (method === 'GET' && path === '/api/v1/admin/history') {
+      if (!adminAuth(req)) return json(res, { error: { code: 'UNAUTHORIZED' } }, 403);
+      const page = parseInt(url.searchParams.get('page') || '1', 10);
+      const limit = Math.min(parseInt(url.searchParams.get('limit') || '20', 10), 100);
+      const offset = (page - 1) * limit;
+      let where = 'WHERE 1=1';
+      const params = [];
+      const userId = url.searchParams.get('user_id');
+      const type = url.searchParams.get('type');
+      const from = url.searchParams.get('from');
+      const to = url.searchParams.get('to');
+      if (userId) { where += ' AND user_id = ?'; params.push(userId); }
+      if (type) { where += ' AND operation_type = ?'; params.push(type); }
+      if (from) { where += ' AND created_at >= ?'; params.push(from); }
+      if (to) { where += ' AND created_at <= ?'; params.push(to); }
+      const items = db.prepare(`SELECT * FROM operation_logs ${where} ORDER BY created_at DESC LIMIT ? OFFSET ?`).all(...params, limit, offset);
+      const total = db.prepare(`SELECT COUNT(*) c FROM operation_logs ${where}`).get(...params).c;
+      return json(res, { items, total, page, limit });
+    }
+
     if (method === 'GET' && path === '/api/v1/admin/users') {
       if (!adminAuth(req)) return json(res, { error: { code: 'UNAUTHORIZED' } }, 403);
-      const items = db.prepare('SELECT id,username,email,role,created_at,last_login_at FROM users ORDER BY created_at DESC').all();
-      return json(res, { items, total: items.length });
+      const page = parseInt(url.searchParams.get('page') || '1', 10);
+      const limit = Math.min(parseInt(url.searchParams.get('limit') || '20', 10), 50);
+      const offset = (page - 1) * limit;
+      const items = db.prepare('SELECT id,username,email,role,created_at,last_login_at FROM users ORDER BY created_at DESC LIMIT ? OFFSET ?').all(limit, offset);
+      const total = db.prepare('SELECT COUNT(*) c FROM users').get().c;
+      return json(res, { items, total, page, limit });
     }
 
     if (method === 'GET' && path === '/api/v1/admin/errors') {
