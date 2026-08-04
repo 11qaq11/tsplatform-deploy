@@ -226,6 +226,10 @@ const server = http.createServer(async (req, res) => {
 
     // ========== Auth ==========
     if (method === 'GET' && path === '/api/v1/auth/feishu/authorize') {
+      // Bound the anonymous state map to prevent memory exhaustion.
+      if (pendingSessions.size > 10000) {
+        return json(res, { error: { code: 'TOO_MANY_REQUESTS', message: 'Too many authorization requests, try again later' } }, 429);
+      }
       const state = crypto.randomUUID();
       const redirect = url.searchParams.get('redirect');
       if (redirect) {
@@ -321,8 +325,9 @@ const server = http.createServer(async (req, res) => {
         res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
         return res.end(htmlPage('Login Success', user.username, true));
       } catch (err) {
+        console.error('[auth] feishu callback error:', err && err.message);
         res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
-        return res.end(htmlPage('Auth Failed', err.message, false));
+        return res.end(htmlPage('Auth Failed', 'Authentication failed, please retry', false));
       }
     }
 
