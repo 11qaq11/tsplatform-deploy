@@ -128,7 +128,7 @@ function parseBody(req) {
     const len = parseInt(req.headers['content-length'] || '0', 10);
     if (len > MAX_BODY_BYTES) { resolve({ __too_large: true }); return; }
     let body = '';
-    req.on('data', c => { body += c; if (body.length > MAX_BODY_BYTES) { req.destroy(); } });
+    req.on('data', c => { body += c; if (body.length > MAX_BODY_BYTES) { req.destroy(); resolve({ __too_large: true }); } });
     req.on('end', () => {
       try { resolve(JSON.parse(body)); } catch { resolve({}); }
     });
@@ -207,6 +207,7 @@ const server = http.createServer(async (req, res) => {
 
       try {
         const body = await parseBody(req);
+        if (body.__too_large) return json(res, { error: { code: 'PAYLOAD_TOO_LARGE', message: 'Request body too large' } }, 413);
         const upstream = await fetch(targetUrl, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + aiApiKey },
@@ -341,6 +342,7 @@ const server = http.createServer(async (req, res) => {
     if (method === 'POST' && path === '/api/v1/sync/push') {
       const u = auth(req); if (!u) return json(res, { error: { code: 'UNAUTHORIZED' } }, 401);
       const body = await parseBody(req);
+      if (body.__too_large) return json(res, { error: { code: 'PAYLOAD_TOO_LARGE', message: 'Request body too large' } }, 413);
       let accepted = 0;
       const stmt = db.prepare('INSERT OR REPLACE INTO conversations (id,user_id,user_message,agent_reply,model_name,token_usage,created_at) VALUES (?,?,?,?,?,?,?)');
       for (const c of (body.conversations || [])) { stmt.run(c.id, u.id, c.user_message, c.agent_reply, c.model_name, c.token_usage || 0, c.created_at); accepted++; }
@@ -399,6 +401,7 @@ const server = http.createServer(async (req, res) => {
     if (method === 'POST' && path === '/api/v1/admin/tools') {
       if (!adminAuth(req)) return json(res, { error: { code: 'UNAUTHORIZED' } }, 403);
       const body = await parseBody(req);
+      if (body.__too_large) return json(res, { error: { code: 'PAYLOAD_TOO_LARGE', message: 'Request body too large' } }, 413);
       const id = body.id || crypto.randomUUID();
       const status = body.status || 'published';
       if (!['published', 'unpublished', 'pending'].includes(status)) {
@@ -463,6 +466,7 @@ const server = http.createServer(async (req, res) => {
       const existing = db.prepare('SELECT * FROM tools WHERE id = ?').get(id);
       if (!existing) return json(res, { error: { code: 'NOT_FOUND', message: 'Tool not found' } }, 404);
       const body = await parseBody(req);
+      if (body.__too_large) return json(res, { error: { code: 'PAYLOAD_TOO_LARGE', message: 'Request body too large' } }, 413);
       if (body.status !== undefined && !['published', 'unpublished', 'pending'].includes(body.status)) {
         return json(res, { error: { code: 'VALIDATION_ERROR', message: 'Invalid status' } }, 400);
       }
@@ -521,6 +525,7 @@ const server = http.createServer(async (req, res) => {
       const target = db.prepare('SELECT * FROM users WHERE id = ?').get(id);
       if (!target) return json(res, { error: { code: 'NOT_FOUND', message: 'User not found' } }, 404);
       const body = await parseBody(req);
+      if (body.__too_large) return json(res, { error: { code: 'PAYLOAD_TOO_LARGE', message: 'Request body too large' } }, 413);
       if (field === 'role') {
         if (!['admin', 'user'].includes(body.role)) return json(res, { error: { code: 'VALIDATION_ERROR', message: 'Invalid role' } }, 400);
         db.prepare('UPDATE users SET role = ? WHERE id = ?').run(body.role, id);
