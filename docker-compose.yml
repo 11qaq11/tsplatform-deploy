@@ -13,6 +13,7 @@ services:
       - FEISHU_APP_ID=${FEISHU_APP_ID}
       - FEISHU_APP_SECRET=${FEISHU_APP_SECRET}
       - ADMIN_FEISHU_OPEN_ID=${ADMIN_FEISHU_OPEN_ID}
+      - OWNER_FEISHU_OPEN_ID=${OWNER_FEISHU_OPEN_ID}
       - AI_MODEL_API_KEY=${AI_MODEL_API_KEY}
     volumes:
       - tsplatform_data:/data

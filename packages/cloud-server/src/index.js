@@ -29,7 +29,7 @@ db.exec(`
     username TEXT,
     email TEXT,
     avatar_url TEXT,
-    role TEXT DEFAULT 'user' CHECK(role IN ('user','admin')),
+    role TEXT DEFAULT 'user' CHECK(role IN ('user','admin','owner')),
     status TEXT DEFAULT 'active' CHECK(status IN ('active','disabled')),
     created_at TEXT DEFAULT (datetime('now')),
     last_login_at TEXT DEFAULT (datetime('now')),
@@ -37,6 +37,30 @@ db.exec(`
     session_expires_at TEXT
   );
 `);
+
+// Migrate legacy users table whose role CHECK lacks 'owner' by rebuilding it.
+const usersTableSql = db.prepare("SELECT sql FROM sqlite_master WHERE type='table' AND name='users'").get();
+if (usersTableSql && !/owner/.test(usersTableSql.sql)) {
+  db.exec(`
+    ALTER TABLE users RENAME TO users_old;
+    CREATE TABLE users (
+      id TEXT PRIMARY KEY,
+      feishu_open_id TEXT UNIQUE,
+      feishu_union_id TEXT,
+      username TEXT,
+      email TEXT,
+      avatar_url TEXT,
+      role TEXT DEFAULT 'user' CHECK(role IN ('user','admin','owner')),
+      status TEXT DEFAULT 'active' CHECK(status IN ('active','disabled')),
+      created_at TEXT DEFAULT (datetime('now')),
+      last_login_at TEXT DEFAULT (datetime('now')),
+      session_token TEXT,
+      session_expires_at TEXT
+    );
+    INSERT INTO users SELECT id,feishu_open_id,feishu_union_id,username,email,avatar_url,role,status,created_at,last_login_at,session_token,session_expires_at FROM users_old;
+    DROP TABLE users_old;
+  `);
+}
 
 // Migration for existing databases: add status column if missing
 const userCols = db.prepare('PRAGMA table_info(users)').all().map((col) => col.name);
@@ -161,13 +185,14 @@ function auth(req) {
 
 function adminAuth(req) {
   const u = auth(req);
-  return (u && u.role === 'admin') ? u : null;
+  return (u && (u.role === 'admin' || u.role === 'owner')) ? u : null;
 }
 
 // === Router ===
 
 const pendingSessions = new Map();
-setInterval(() => { const now = Date.now(); for (const [key, entry] of pendingSessions) { if (now - entry.created > 300000) pendingSessions.delete(key); } }, 300000);
+const pendingTransfers = new Map();
+setInterval(() => { const now = Date.now(); for (const [key, entry] of pendingSessions) { if (now - entry.created > 300000) pendingSessions.delete(key); } for (const [key, entry] of pendingTransfers) { if (now - entry.created > 600000) pendingTransfers.delete(key); } }, 300000);
 
 const server = http.createServer(async (req, res) => {
   if (req.method === 'OPTIONS') {
@@ -231,7 +256,52 @@ const server = http.createServer(async (req, res) => {
       }
     }
 
+    // Complete an ownership transfer after Feishu re-authorization.
+    if (method === 'POST' && path === '/api/v1/admin/ownership/transfer') {
+      const me = adminAuth(req);
+      if (!me || me.role !== 'owner') return json(res, { error: { code: 'UNAUTHORIZED' } }, 403);
+      const body = await parseBody(req);
+      if (body.__too_large) return json(res, { error: { code: 'PAYLOAD_TOO_LARGE', message: 'Request body too large' } }, 413);
+      const confirm = pendingTransfers.get(body.confirm_token);
+      if (!confirm || !confirm.owner_id || confirm.owner_id !== me.id) {
+        return json(res, { error: { code: 'FORBIDDEN', message: 'Transfer confirmation expired or not authorized by the owner' } }, 403);
+      }
+      const target = db.prepare('SELECT * FROM users WHERE id = ?').get(confirm.target_user_id);
+      if (!target || target.role === 'owner') {
+        pendingTransfers.delete(body.confirm_token);
+        return json(res, { error: { code: 'NOT_FOUND', message: 'Target user not found or already owner' } }, 404);
+      }
+      const t = db.transaction(() => {
+        db.prepare('UPDATE users SET role = ? WHERE id = ?').run('admin', me.id);
+        db.prepare('UPDATE users SET role = ? WHERE id = ?').run('owner', target.id);
+      });
+      t();
+      pendingTransfers.delete(body.confirm_token);
+      pendingSessions.delete(confirm.state);
+      return json(res, { success: true });
+    }
+
     // ========== Auth ==========
+    // Ownership transfer: request a fresh Feishu authorization to confirm identity.
+    if (method === 'POST' && path === '/api/v1/admin/ownership/transfer-request') {
+      const me = adminAuth(req);
+      if (!me || me.role !== 'owner') return json(res, { error: { code: 'UNAUTHORIZED' } }, 403);
+      const body = await parseBody(req);
+      if (body.__too_large) return json(res, { error: { code: 'PAYLOAD_TOO_LARGE', message: 'Request body too large' } }, 413);
+      const targetId = body.target_user_id;
+      if (!targetId || typeof targetId !== 'string') return json(res, { error: { code: 'VALIDATION_ERROR', message: 'target_user_id is required' } }, 400);
+      const target = db.prepare('SELECT * FROM users WHERE id = ?').get(targetId);
+      if (!target) return json(res, { error: { code: 'NOT_FOUND', message: 'User not found' } }, 404);
+      if (target.id === me.id) return json(res, { error: { code: 'FORBIDDEN', message: 'Cannot transfer ownership to yourself' } }, 403);
+      if (target.role === 'owner') return json(res, { error: { code: 'FORBIDDEN', message: 'Target is already the owner' } }, 403);
+      const state = crypto.randomUUID();
+      const confirmToken = crypto.randomUUID();
+      pendingTransfers.set(confirmToken, { state, target_user_id: targetId, owner_id: null, created: Date.now() });
+      pendingSessions.set(state, { transferConfirm: confirmToken, created: Date.now() });
+      const p = new URLSearchParams({ app_id: FEISHU_APP_ID, redirect_uri: FEISHU_REDIRECT_URI, state,  });
+      return json(res, { confirm_token: confirmToken, redirect_url: `https://open.feishu.cn/open-apis/authen/v1/index?${p}` });
+    }
+
     if (method === 'GET' && path === '/api/v1/auth/feishu/authorize') {
       const state = crypto.randomUUID();
       const redirect = url.searchParams.get('redirect');
@@ -298,7 +368,9 @@ const server = http.createServer(async (req, res) => {
         const exp = new Date(Date.now() + 7 * 86400000).toISOString();
 
         if (user) {
-          if (isAdmin && user.role !== 'admin') db.prepare("UPDATE users SET role='admin' WHERE id=?").run(user.id);
+          const isOwner = process.env.OWNER_FEISHU_OPEN_ID && process.env.OWNER_FEISHU_OPEN_ID.split(',').includes(open_id);
+          if (isOwner && user.role !== 'owner') db.prepare("UPDATE users SET role='owner' WHERE id=?").run(user.id);
+          if (isAdmin && !isOwner && user.role !== 'admin') db.prepare("UPDATE users SET role='admin' WHERE id=?").run(user.id);
           if (user.status === 'disabled') {
             db.prepare('UPDATE users SET session_token=NULL, session_expires_at=NULL WHERE id=?').run(user.id);
             res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
@@ -308,7 +380,7 @@ const server = http.createServer(async (req, res) => {
           user = db.prepare('SELECT * FROM users WHERE id=?').get(user.id);
         } else {
           const id = crypto.randomUUID();
-          const role = isAdmin ? 'admin' : 'user';
+          const role = isOwner ? 'owner' : (isAdmin ? 'admin' : 'user');
           db.prepare('INSERT INTO users (id,feishu_open_id,feishu_union_id,username,email,avatar_url,session_token,session_expires_at,role) VALUES (?,?,?,?,?,?,?,?,?)').run(id, open_id, union_id, name, email || null, avatar_url || null, token, exp, role);
           user = db.prepare('SELECT * FROM users WHERE id=?').get(id);
         }
@@ -321,6 +393,20 @@ const server = http.createServer(async (req, res) => {
 
         if (state) {
           const entry = pendingSessions.get(state);
+          if (entry && entry.transferConfirm) {
+            // Ownership-transfer confirmation: the freshly authorized user must be the current owner.
+            const confirm = pendingTransfers.get(entry.transferConfirm);
+            if (confirm && confirm.owner_id === null && user.role === 'owner') {
+              confirm.owner_id = user.id;
+              const cbBase = ADMIN_PANEL_ORIGIN.replace(/\/+$/, '');
+              res.writeHead(302, { Location: `${cbBase}/auth/callback#transfer_confirm=${encodeURIComponent(entry.transferConfirm)}` });
+              return res.end();
+            }
+            pendingTransfers.delete(entry.transferConfirm);
+            pendingSessions.delete(state);
+            res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+            return res.end(htmlPage('Transfer Failed', 'Authorization did not match the current owner', false));
+          }
           if (entry && entry.redirect) {
             pendingSessions.delete(state);
             res.writeHead(302, { Location: `${entry.redirect}#token=${encodeURIComponent(user.session_token)}&expires_at=${encodeURIComponent(user.session_expires_at)}` });
@@ -549,8 +635,15 @@ const server = http.createServer(async (req, res) => {
       const page = parseInt(url.searchParams.get('page') || '1', 10);
       const limit = Math.min(parseInt(url.searchParams.get('limit') || '20', 10), 50);
       const offset = (page - 1) * limit;
-      const items = db.prepare('SELECT id,username,email,role,status,created_at,last_login_at FROM users ORDER BY created_at DESC LIMIT ? OFFSET ?').all(limit, offset);
-      const total = db.prepare('SELECT COUNT(*) c FROM users').get().c;
+      const search = url.searchParams.get('search');
+      let where = 'WHERE 1=1';
+      const params = [];
+      if (search && search.trim()) {
+        where += ' AND (username LIKE ? OR email LIKE ?)';
+        params.push(`%${search.trim()}%`, `%${search.trim()}%`);
+      }
+      const items = db.prepare(`SELECT id,username,email,role,status,created_at,last_login_at FROM users ${where} ORDER BY created_at DESC LIMIT ? OFFSET ?`).all(...params, limit, offset);
+      const total = db.prepare(`SELECT COUNT(*) c FROM users ${where}`).get(...params).c;
       return json(res, { items, total, page, limit });
     }
 
@@ -566,7 +659,13 @@ const server = http.createServer(async (req, res) => {
       const body = await parseBody(req);
       if (body.__too_large) return json(res, { error: { code: 'PAYLOAD_TOO_LARGE', message: 'Request body too large' } }, 413);
       if (field === 'role') {
-        if (!['admin', 'user'].includes(body.role)) return json(res, { error: { code: 'VALIDATION_ERROR', message: 'Invalid role' } }, 400);
+        const me = adminAuth(req);
+        if (target.role === 'owner') return json(res, { error: { code: 'FORBIDDEN', message: 'Cannot change the owner role here; use ownership transfer' } }, 403);
+        if (body.role === 'owner') {
+          if (me.role !== 'owner') return json(res, { error: { code: 'FORBIDDEN', message: 'Only the owner can grant owner' } }, 403);
+        } else if (!['admin', 'user'].includes(body.role)) {
+          return json(res, { error: { code: 'VALIDATION_ERROR', message: 'Invalid role' } }, 400);
+        }
         db.prepare('UPDATE users SET role = ? WHERE id = ?').run(body.role, id);
       } else {
         if (!['active', 'disabled'].includes(body.status)) return json(res, { error: { code: 'VALIDATION_ERROR', message: 'Invalid status' } }, 400);
