@@ -1,13 +1,10 @@
 // TsPlatform Cloud Server — 纯 Node.js 实现，零框架依赖
 const http = require('http');
-const fsMod = require('fs');
-const pathMod = require('path');
 const crypto = require('crypto');
 const Database = require('better-sqlite3');
 
 const PORT = parseInt(process.env.API_PORT || '3000', 10);
 const DB_PATH = process.env.DB_PATH || '/data/tsplatform.db';
-const STORAGE_PATH = process.env.STORAGE_PATH || '/data';
 const API_BASE_URL = process.env.API_BASE_URL || `http://122.51.90.193:${PORT}`;
 
 const FEISHU_APP_ID = process.env.FEISHU_APP_ID || '';
@@ -120,15 +117,10 @@ function htmlPage(title, message, success) {
 
 // === Helpers ===
 
-const MAX_BODY_BYTES = 140 * 1024 * 1024; // 100MB zip base64 (~139.8MB) + JSON overhead
-
 function parseBody(req) {
   return new Promise(resolve => {
-    // First-line DoS guard: reject oversized bodies before buffering.
-    const len = parseInt(req.headers['content-length'] || '0', 10);
-    if (len > MAX_BODY_BYTES) { resolve({ __too_large: true }); return; }
     let body = '';
-    req.on('data', c => { body += c; if (body.length > MAX_BODY_BYTES) { req.destroy(); } });
+    req.on('data', c => { body += c; });
     req.on('end', () => {
       try { resolve(JSON.parse(body)); } catch { resolve({}); }
     });
@@ -400,55 +392,8 @@ const server = http.createServer(async (req, res) => {
       if (!adminAuth(req)) return json(res, { error: { code: 'UNAUTHORIZED' } }, 403);
       const body = await parseBody(req);
       const id = body.id || crypto.randomUUID();
-      const status = body.status || 'published';
-      if (!['published', 'unpublished', 'pending'].includes(status)) {
-        return json(res, { error: { code: 'VALIDATION_ERROR', message: 'Invalid status' } }, 400);
-      }
-      let storagePath = body.storage_path || '';
-      let manifest = body.manifest || null;
-
-      // Optional tool package upload (base64 zip). Stored under /data/tools/.
-      if (body.file_base64 && typeof body.file_base64 === 'string') {
-        // Pre-check base64 string length before decoding (DoS guard).
-        if (body.file_base64.length > Math.ceil((100 * 1024 * 1024) / 3) * 4) {
-          return json(res, { error: { code: 'VALIDATION_ERROR', message: 'Package too large (max 100MB)' } }, 400);
-        }
-        const buf = Buffer.from(body.file_base64, 'base64');
-        if (buf.length > 100 * 1024 * 1024) {
-          return json(res, { error: { code: 'VALIDATION_ERROR', message: 'Package too large (max 100MB)' } }, 400);
-        }
-        if (buf.length < 4 || buf.toString('latin1', 0, 4) !== 'PK\u0003\u0004') {
-          return json(res, { error: { code: 'VALIDATION_ERROR', message: 'Invalid zip file' } }, 400);
-        }
-        const toolsDir = pathMod.join(STORAGE_PATH, 'tools');
-        fsMod.mkdirSync(toolsDir, { recursive: true });
-        const rawName = body.filename && /\.zip$/i.test(body.filename) ? body.filename : `${id}.zip`;
-        const filename = pathMod.basename(rawName); // prevent path traversal
-        fsMod.writeFileSync(pathMod.join(toolsDir, filename), buf);
-        storagePath = `tools/${filename}`;
-        manifest = JSON.stringify({ format: 'miniapp-zip', filename, size: buf.length, uploaded_at: new Date().toISOString() });
-      }
-
-      db.prepare('INSERT INTO tools (id,name,description,category,version,author,manifest,storage_path,status) VALUES (?,?,?,?,?,?,?,?,?)').run(id, body.name, body.description, body.category, body.version, body.author, manifest, storagePath, status);
+      db.prepare('INSERT INTO tools (id,name,description,category,version,author,manifest,storage_path) VALUES (?,?,?,?,?,?,?,?)').run(id, body.name, body.description, body.category, body.version, body.author, JSON.stringify(body.manifest || {}), body.storage_path || '');
       return json(res, { success: true, id }, 201);
-    }
-
-    const toolDownloadMatch = path.match(/^\/api\/v1\/admin\/tools\/([^/]+)\/download$/);
-    if (method === 'GET' && toolDownloadMatch) {
-      if (!adminAuth(req)) return json(res, { error: { code: 'UNAUTHORIZED' } }, 403);
-      const id = toolDownloadMatch[1];
-      const tool = db.prepare('SELECT * FROM tools WHERE id = ?').get(id);
-      if (!tool || !tool.storage_path) return json(res, { error: { code: 'NOT_FOUND', message: 'Tool package not found' } }, 404);
-      const filePath = pathMod.join(STORAGE_PATH, 'tools', pathMod.basename(tool.storage_path || ''));
-      if (!fsMod.existsSync(filePath)) return json(res, { error: { code: 'NOT_FOUND', message: 'Package file missing' } }, 404);
-      const filename = pathMod.basename(filePath).replace(/"/g, '');
-      res.writeHead(200, {
-        'Content-Type': 'application/zip',
-        'Content-Disposition': `attachment; filename="${filename}"`,
-        'Content-Length': fsMod.statSync(filePath).size,
-      });
-      fsMod.createReadStream(filePath).pipe(res);
-      return;
     }
 
     if (method === 'GET' && path === '/api/v1/admin/tools') {
@@ -463,9 +408,6 @@ const server = http.createServer(async (req, res) => {
       const existing = db.prepare('SELECT * FROM tools WHERE id = ?').get(id);
       if (!existing) return json(res, { error: { code: 'NOT_FOUND', message: 'Tool not found' } }, 404);
       const body = await parseBody(req);
-      if (body.status !== undefined && !['published', 'unpublished', 'pending'].includes(body.status)) {
-        return json(res, { error: { code: 'VALIDATION_ERROR', message: 'Invalid status' } }, 400);
-      }
       if (body.status) db.prepare("UPDATE tools SET status = ? WHERE id = ?").run(body.status, id);
       if (body.name) db.prepare('UPDATE tools SET name = ? WHERE id = ?').run(body.name, id);
       if (body.description) db.prepare('UPDATE tools SET description = ? WHERE id = ?').run(body.description, id);
