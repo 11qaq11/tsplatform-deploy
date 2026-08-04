@@ -436,6 +436,30 @@ const server = http.createServer(async (req, res) => {
       return json(res, { success: true, id }, 201);
     }
 
+    // User-facing tool package download: authenticated users may download
+    // published tools (pending/unpublished are withheld). Serves /tools/:id/files.
+    const toolFilesMatch = path.match(/^\/api\/v1\/tools\/([^/]+)\/files$/);
+    if (method === 'GET' && toolFilesMatch) {
+      const user = auth(req);
+      if (!user) return json(res, { error: { code: 'UNAUTHORIZED' } }, 401);
+      const id = toolFilesMatch[1];
+      const tool = db.prepare('SELECT * FROM tools WHERE id = ?').get(id);
+      if (!tool || !tool.storage_path || tool.status !== 'published') {
+        return json(res, { error: { code: 'NOT_FOUND', message: 'Tool package not found' } }, 404);
+      }
+      const filePath = pathMod.join(STORAGE_PATH, 'tools', pathMod.basename(tool.storage_path || ''));
+      if (!fsMod.existsSync(filePath)) return json(res, { error: { code: 'NOT_FOUND', message: 'Package file missing' } }, 404);
+      db.prepare('UPDATE tools SET download_count = download_count + 1 WHERE id = ?').run(id);
+      const filename = pathMod.basename(filePath).replace(/"/g, '');
+      res.writeHead(200, {
+        'Content-Type': 'application/zip',
+        'Content-Disposition': `attachment; filename="${filename}"`,
+        'Content-Length': fsMod.statSync(filePath).size,
+      });
+      fsMod.createReadStream(filePath).pipe(res);
+      return;
+    }
+
     const toolDownloadMatch = path.match(/^\/api\/v1\/admin\/tools\/([^/]+)\/download$/);
     if (method === 'GET' && toolDownloadMatch) {
       if (!adminAuth(req)) return json(res, { error: { code: 'UNAUTHORIZED' } }, 403);
