@@ -267,9 +267,9 @@ const server = http.createServer(async (req, res) => {
         return json(res, { error: { code: 'FORBIDDEN', message: 'Transfer confirmation expired or not authorized by the owner' } }, 403);
       }
       const target = db.prepare('SELECT * FROM users WHERE id = ?').get(confirm.target_user_id);
-      if (!target || target.role === 'owner') {
+      if (!target || target.role === 'owner' || target.status === 'disabled') {
         pendingTransfers.delete(body.confirm_token);
-        return json(res, { error: { code: 'NOT_FOUND', message: 'Target user not found or already owner' } }, 404);
+        return json(res, { error: { code: 'NOT_FOUND', message: 'Target user not found, disabled, or already owner' } }, 404);
       }
       const t = db.transaction(() => {
         db.prepare('UPDATE users SET role = ? WHERE id = ?').run('admin', me.id);
