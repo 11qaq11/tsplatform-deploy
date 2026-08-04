@@ -226,13 +226,13 @@ const server = http.createServer(async (req, res) => {
 
     // ========== Auth ==========
     if (method === 'GET' && path === '/api/v1/auth/feishu/authorize') {
-      // Bound the anonymous state map to prevent memory exhaustion.
-      if (pendingSessions.size > 10000) {
-        return json(res, { error: { code: 'TOO_MANY_REQUESTS', message: 'Too many authorization requests, try again later' } }, 429);
-      }
       const state = crypto.randomUUID();
       const redirect = url.searchParams.get('redirect');
       if (redirect) {
+        // Bound the anonymous state map to prevent memory exhaustion.
+        if (pendingSessions.size > 10000) {
+          return json(res, { error: { code: 'TOO_MANY_REQUESTS', message: 'Too many authorization requests, try again later' } }, 429);
+        }
         let allowed = false;
         try { allowed = new URL(redirect).origin === ADMIN_PANEL_ORIGIN; } catch { allowed = false; }
         if (!allowed) return json(res, { error: { code: 'VALIDATION_ERROR', message: 'Invalid redirect' } }, 400);
@@ -260,7 +260,7 @@ const server = http.createServer(async (req, res) => {
         const atData = await atRes.json();
         if (atData.code !== 0 || !atData.app_access_token) {
           res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
-          return res.end(htmlPage('Auth Failed', atData.msg || 'Failed to get app token', false));
+          return res.end(htmlPage('Auth Failed', 'Failed to get app token, please retry', false));
         }
 
         const tb = new URLSearchParams({ grant_type: 'authorization_code', code });
@@ -268,7 +268,7 @@ const server = http.createServer(async (req, res) => {
         const td = await tr.json();
         if (td.code !== 0) {
           res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
-          return res.end(htmlPage('Auth Failed', td.msg || 'Code exchange failed', false));
+          return res.end(htmlPage('Auth Failed', 'Code exchange failed, please retry', false));
         }
 
         const ur = await fetch('https://open.feishu.cn/open-apis/authen/v1/user_info', { headers: { 'Authorization': 'Bearer ' + td.data.access_token } });
@@ -325,7 +325,7 @@ const server = http.createServer(async (req, res) => {
         res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
         return res.end(htmlPage('Login Success', user.username, true));
       } catch (err) {
-        console.error('[auth] feishu callback error:', err && err.message);
+        console.error('[auth] feishu callback error:', err && (err.stack || err.message));
         res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
         return res.end(htmlPage('Auth Failed', 'Authentication failed, please retry', false));
       }
