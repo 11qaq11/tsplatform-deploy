@@ -263,7 +263,7 @@ const server = http.createServer(async (req, res) => {
       const body = await parseBody(req);
       if (body.__too_large) return json(res, { error: { code: 'PAYLOAD_TOO_LARGE', message: 'Request body too large' } }, 413);
       const confirm = pendingTransfers.get(body.confirm_token);
-      if (!confirm || !confirm.owner_id || confirm.owner_id !== me.id) {
+      if (!confirm || Date.now() - confirm.created > 600000 || !confirm.owner_id || confirm.owner_id !== me.id) {
         return json(res, { error: { code: 'FORBIDDEN', message: 'Transfer confirmation expired or not authorized by the owner' } }, 403);
       }
       const target = db.prepare('SELECT * FROM users WHERE id = ?').get(confirm.target_user_id);
@@ -294,6 +294,7 @@ const server = http.createServer(async (req, res) => {
       if (!target) return json(res, { error: { code: 'NOT_FOUND', message: 'User not found' } }, 404);
       if (target.id === me.id) return json(res, { error: { code: 'FORBIDDEN', message: 'Cannot transfer ownership to yourself' } }, 403);
       if (target.role === 'owner') return json(res, { error: { code: 'FORBIDDEN', message: 'Target is already the owner' } }, 403);
+      if (target.status === 'disabled') return json(res, { error: { code: 'FORBIDDEN', message: 'Cannot transfer ownership to a disabled user' } }, 403);
       const state = crypto.randomUUID();
       const confirmToken = crypto.randomUUID();
       pendingTransfers.set(confirmToken, { state, target_user_id: targetId, owner_id: null, created: Date.now() });
@@ -369,7 +370,10 @@ const server = http.createServer(async (req, res) => {
 
         if (user) {
           const isOwner = process.env.OWNER_FEISHU_OPEN_ID && process.env.OWNER_FEISHU_OPEN_ID.split(',').includes(open_id);
-          if (isOwner && user.role !== 'owner') db.prepare("UPDATE users SET role='owner' WHERE id=?").run(user.id);
+          if (isOwner && user.role !== 'owner') {
+            const ownerCount = db.prepare("SELECT COUNT(*) c FROM users WHERE role='owner'").get().c;
+            if (ownerCount === 0) db.prepare("UPDATE users SET role='owner' WHERE id=?").run(user.id);
+          }
           if (isAdmin && !isOwner && user.role !== 'admin') db.prepare("UPDATE users SET role='admin' WHERE id=?").run(user.id);
           if (user.status === 'disabled') {
             db.prepare('UPDATE users SET session_token=NULL, session_expires_at=NULL WHERE id=?').run(user.id);
@@ -380,7 +384,8 @@ const server = http.createServer(async (req, res) => {
           user = db.prepare('SELECT * FROM users WHERE id=?').get(user.id);
         } else {
           const id = crypto.randomUUID();
-          const role = isOwner ? 'owner' : (isAdmin ? 'admin' : 'user');
+          const ownerCount = db.prepare("SELECT COUNT(*) c FROM users WHERE role='owner'").get().c;
+          const role = isOwner && ownerCount === 0 ? 'owner' : (isAdmin ? 'admin' : 'user');
           db.prepare('INSERT INTO users (id,feishu_open_id,feishu_union_id,username,email,avatar_url,session_token,session_expires_at,role) VALUES (?,?,?,?,?,?,?,?,?)').run(id, open_id, union_id, name, email || null, avatar_url || null, token, exp, role);
           user = db.prepare('SELECT * FROM users WHERE id=?').get(id);
         }
@@ -668,6 +673,7 @@ const server = http.createServer(async (req, res) => {
         }
         db.prepare('UPDATE users SET role = ? WHERE id = ?').run(body.role, id);
       } else {
+        if (target.role === 'owner') return json(res, { error: { code: 'FORBIDDEN', message: 'Cannot disable the owner' } }, 403);
         if (!['active', 'disabled'].includes(body.status)) return json(res, { error: { code: 'VALIDATION_ERROR', message: 'Invalid status' } }, 400);
         db.prepare('UPDATE users SET status = ? WHERE id = ?').run(body.status, id);
         if (body.status === 'disabled') db.prepare('UPDATE users SET session_token=NULL, session_expires_at=NULL WHERE id=?').run(id);
@@ -683,6 +689,7 @@ const server = http.createServer(async (req, res) => {
       if (me && me.id === id) return json(res, { error: { code: 'FORBIDDEN', message: 'Cannot delete your own account' } }, 403);
       const target = db.prepare('SELECT * FROM users WHERE id = ?').get(id);
       if (!target) return json(res, { error: { code: 'NOT_FOUND', message: 'User not found' } }, 404);
+      if (target.role === 'owner') return json(res, { error: { code: 'FORBIDDEN', message: 'Cannot delete the owner' } }, 403);
       db.prepare('DELETE FROM users WHERE id = ?').run(id);
       return json(res, { success: true });
     }
