@@ -297,6 +297,9 @@ const server = http.createServer(async (req, res) => {
       if (target.status === 'disabled') return json(res, { error: { code: 'FORBIDDEN', message: 'Cannot transfer ownership to a disabled user' } }, 403);
       const state = crypto.randomUUID();
       const confirmToken = crypto.randomUUID();
+      if (pendingTransfers.size > 10000) {
+        return json(res, { error: { code: 'TOO_MANY_REQUESTS', message: 'Too many transfer requests, try again later' } }, 429);
+      }
       pendingTransfers.set(confirmToken, { state, target_user_id: targetId, owner_id: null, created: Date.now() });
       pendingSessions.set(state, { transferConfirm: confirmToken, created: Date.now() });
       const p = new URLSearchParams({ app_id: FEISHU_APP_ID, redirect_uri: FEISHU_REDIRECT_URI, state,  });
