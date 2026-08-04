@@ -366,13 +366,14 @@ const server = http.createServer(async (req, res) => {
       return json(res, { items: db.prepare(sql + ' ORDER BY like_count DESC LIMIT 50').all(...p), total: 0 });
     }
 
-    // Like toggle
+    // Like toggle (published only)
     const likeMatch = path.match(/^\/api\/v1\/tools\/(.+)\/like$/);
     if (method === 'POST' && likeMatch) {
       const u = auth(req); if (!u) return json(res, { error: { code: 'UNAUTHORIZED' } }, 401);
+      const tool = db.prepare('SELECT like_count, status FROM tools WHERE id=?').get(likeMatch[1]);
+      if (!tool || tool.status !== 'published') return json(res, { error: { code: 'NOT_FOUND', message: 'Tool not found' } }, 404);
       db.prepare('UPDATE tools SET like_count=like_count+1 WHERE id=?').run(likeMatch[1]);
-      const t = db.prepare('SELECT like_count FROM tools WHERE id=?').get(likeMatch[1]);
-      return json(res, { like_count: t?.like_count || 0, liked: true });
+      return json(res, { like_count: (tool.like_count || 0) + 1, liked: true });
     }
 
     // ========== User Space ==========
