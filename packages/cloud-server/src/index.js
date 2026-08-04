@@ -669,9 +669,12 @@ const server = http.createServer(async (req, res) => {
       if (field === 'role') {
         const me = adminAuth(req);
         if (target.role === 'owner') return json(res, { error: { code: 'FORBIDDEN', message: 'Cannot change the owner role here; use ownership transfer' } }, 403);
+        // owner is never assignable via this endpoint: the single-owner invariant
+        // is maintained exclusively through the Feishu re-auth transfer flow.
         if (body.role === 'owner') {
-          if (me.role !== 'owner') return json(res, { error: { code: 'FORBIDDEN', message: 'Only the owner can grant owner' } }, 403);
-        } else if (!['admin', 'user'].includes(body.role)) {
+          return json(res, { error: { code: 'FORBIDDEN', message: 'Owner role is only assignable via ownership transfer' } }, 403);
+        }
+        if (!['admin', 'user'].includes(body.role)) {
           return json(res, { error: { code: 'VALIDATION_ERROR', message: 'Invalid role' } }, 400);
         }
         db.prepare('UPDATE users SET role = ? WHERE id = ?').run(body.role, id);
