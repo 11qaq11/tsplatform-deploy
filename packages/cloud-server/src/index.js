@@ -377,7 +377,7 @@ const server = http.createServer(async (req, res) => {
             const ownerCount = db.prepare("SELECT COUNT(*) c FROM users WHERE role='owner'").get().c;
             if (ownerCount === 0) db.prepare("UPDATE users SET role='owner' WHERE id=?").run(user.id);
           }
-          if (isAdmin && !isOwner && user.role !== 'admin') db.prepare("UPDATE users SET role='admin' WHERE id=?").run(user.id);
+          if (isAdmin && !isOwner && user.role !== 'admin' && user.role !== 'owner') db.prepare("UPDATE users SET role='admin' WHERE id=?").run(user.id);
           if (user.status === 'disabled') {
             db.prepare('UPDATE users SET session_token=NULL, session_expires_at=NULL WHERE id=?').run(user.id);
             res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
