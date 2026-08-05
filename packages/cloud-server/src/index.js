@@ -320,7 +320,7 @@ const server = http.createServer(async (req, res) => {
 
     if (method === 'GET' && path === '/api/v1/auth/feishu/authorize') {
       // Per-IP throttle: this endpoint mints states into the shared map.
-      const authIp = (req.socket.remoteAddress || req.headers['x-forwarded-for'] || 'unknown').toString().split(',')[0].trim();
+      const authIp = (req.socket.remoteAddress || 'unknown').toString();
       const authNow = Date.now();
       const authBucket = authorizeBuckets.get(authIp);
       if (!authBucket || authBucket.resetAt < authNow) {
@@ -477,7 +477,7 @@ const server = http.createServer(async (req, res) => {
     if (method === 'POST' && path === '/api/v1/auth/temp-register') {
       // Throttle anonymous registration by the connection address (no trusted
       // proxy sets X-Forwarded-For on this deployment).
-      const ip = (req.socket.remoteAddress || req.headers['x-forwarded-for'] || 'unknown').toString().split(',')[0].trim();
+      const ip = (req.socket.remoteAddress || 'unknown').toString();
       const nowMs = Date.now();
       const bucket = tempRegisterBuckets.get(ip);
       if (!bucket || bucket.resetAt < nowMs) {
