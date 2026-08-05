@@ -472,7 +472,7 @@ const server = http.createServer(async (req, res) => {
         bucket.count += 1;
       }
       // Lazily evict expired temp users so the cap is not a permanent sink.
-      db.prepare("DELETE FROM users WHERE role='temp_user' AND session_expires_at < datetime('now')").run();
+      db.prepare("DELETE FROM users WHERE role='temp_user' AND datetime(session_expires_at) < datetime('now')").run();
       const tempCount = db.prepare("SELECT COUNT(*) c FROM users WHERE role='temp_user'").get().c;
       if (tempCount >= 500) {
         return json(res, { error: { code: 'FORBIDDEN', message: 'Temporary user limit reached' } }, 403);
