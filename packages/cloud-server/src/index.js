@@ -197,7 +197,9 @@ function adminAuth(req) {
 
 const pendingSessions = new Map();
 const pendingTransfers = new Map();
-setInterval(() => { const now = Date.now(); for (const [key, entry] of pendingSessions) { if (now - entry.created > 300000) pendingSessions.delete(key); } for (const [key, entry] of pendingTransfers) { if (now - entry.created > 600000) pendingTransfers.delete(key); } }, 300000);
+// Per-IP throttling for anonymous temp-register (one window per minute).
+const tempRegisterBuckets = new Map();
+setInterval(() => { const now = Date.now(); for (const [key, entry] of pendingSessions) { if (now - entry.created > 300000) pendingSessions.delete(key); } for (const [key, entry] of pendingTransfers) { if (now - entry.created > 600000) pendingTransfers.delete(key); } for (const [key, entry] of tempRegisterBuckets) { if (entry.resetAt < now) tempRegisterBuckets.delete(key); } }, 300000);
 
 const server = http.createServer(async (req, res) => {
   if (req.method === 'OPTIONS') {
@@ -314,6 +316,12 @@ const server = http.createServer(async (req, res) => {
     if (method === 'GET' && path === '/api/v1/auth/feishu/authorize') {
       const state = crypto.randomUUID();
       const redirect = url.searchParams.get('redirect');
+      // Evict expired entries before the bound check so a burst of stale states
+      // cannot permanently exhaust the map (which would 429 all logins).
+      const nowMs = Date.now();
+      for (const [key, entry] of pendingSessions) {
+        if (nowMs - entry.created > 300000) pendingSessions.delete(key);
+      }
       // Bound the anonymous state map to prevent memory exhaustion.
       if (pendingSessions.size > 10000) {
         return json(res, { error: { code: 'TOO_MANY_REQUESTS', message: 'Too many authorization requests, try again later' } }, 429);
@@ -451,6 +459,21 @@ const server = http.createServer(async (req, res) => {
     // POST /auth/temp-register — cloud-side temporary user registration
     // (desktop "temporary login"; appears in admin user management).
     if (method === 'POST' && path === '/api/v1/auth/temp-register') {
+      // Throttle anonymous registration per source IP.
+      const ip = (req.headers['x-forwarded-for'] || req.socket.remoteAddress || 'unknown').toString().split(',')[0].trim();
+      const nowMs = Date.now();
+      const bucket = tempRegisterBuckets.get(ip);
+      if (!bucket || bucket.resetAt < nowMs) {
+        tempRegisterBuckets.set(ip, { count: 1, resetAt: nowMs + 60000 });
+      } else if (bucket.count >= 20) {
+        return json(res, { error: { code: 'TOO_MANY_REQUESTS', message: 'Too many registration attempts, try again later' } }, 429);
+      } else {
+        bucket.count += 1;
+      }
+      const tempCount = db.prepare("SELECT COUNT(*) c FROM users WHERE role='temp_user'").get().c;
+      if (tempCount >= 500) {
+        return json(res, { error: { code: 'FORBIDDEN', message: 'Temporary user limit reached' } }, 403);
+      }
       const body = await parseBody(req);
       if (body.__too_large) return json(res, { error: { code: 'PAYLOAD_TOO_LARGE', message: 'Request body too large' } }, 413);
       const username = typeof body.username === 'string' ? body.username.trim() : '';
