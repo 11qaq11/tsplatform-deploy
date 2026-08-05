@@ -459,8 +459,9 @@ const server = http.createServer(async (req, res) => {
     // POST /auth/temp-register — cloud-side temporary user registration
     // (desktop "temporary login"; appears in admin user management).
     if (method === 'POST' && path === '/api/v1/auth/temp-register') {
-      // Throttle anonymous registration per source IP.
-      const ip = (req.headers['x-forwarded-for'] || req.socket.remoteAddress || 'unknown').toString().split(',')[0].trim();
+      // Throttle anonymous registration by the connection address (no trusted
+      // proxy sets X-Forwarded-For on this deployment).
+      const ip = (req.socket.remoteAddress || req.headers['x-forwarded-for'] || 'unknown').toString().split(',')[0].trim();
       const nowMs = Date.now();
       const bucket = tempRegisterBuckets.get(ip);
       if (!bucket || bucket.resetAt < nowMs) {
@@ -470,6 +471,8 @@ const server = http.createServer(async (req, res) => {
       } else {
         bucket.count += 1;
       }
+      // Lazily evict expired temp users so the cap is not a permanent sink.
+      db.prepare("DELETE FROM users WHERE role='temp_user' AND session_expires_at < datetime('now')").run();
       const tempCount = db.prepare("SELECT COUNT(*) c FROM users WHERE role='temp_user'").get().c;
       if (tempCount >= 500) {
         return json(res, { error: { code: 'FORBIDDEN', message: 'Temporary user limit reached' } }, 403);
