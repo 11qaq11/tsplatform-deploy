@@ -199,7 +199,9 @@ const pendingSessions = new Map();
 const pendingTransfers = new Map();
 // Per-IP throttling for anonymous temp-register (one window per minute).
 const tempRegisterBuckets = new Map();
-setInterval(() => { const now = Date.now(); for (const [key, entry] of pendingSessions) { if (now - entry.created > 300000) pendingSessions.delete(key); } for (const [key, entry] of pendingTransfers) { if (now - entry.created > 600000) pendingTransfers.delete(key); } for (const [key, entry] of tempRegisterBuckets) { if (entry.resetAt < now) tempRegisterBuckets.delete(key); } }, 300000);
+// Per-IP throttle for the state-minting authorize endpoint.
+const authorizeBuckets = new Map();
+setInterval(() => { const now = Date.now(); for (const [key, entry] of pendingSessions) { if (now - entry.created > 300000) pendingSessions.delete(key); } for (const [key, entry] of pendingTransfers) { if (now - entry.created > 600000) pendingTransfers.delete(key); } for (const [key, entry] of tempRegisterBuckets) { if (entry.resetAt < now) tempRegisterBuckets.delete(key); } for (const [key, entry] of authorizeBuckets) { if (entry.resetAt < now) authorizeBuckets.delete(key); } }, 300000);
 
 const server = http.createServer(async (req, res) => {
   if (req.method === 'OPTIONS') {
@@ -302,6 +304,9 @@ const server = http.createServer(async (req, res) => {
       if (target.id === me.id) return json(res, { error: { code: 'FORBIDDEN', message: 'Cannot transfer ownership to yourself' } }, 403);
       if (target.role === 'owner') return json(res, { error: { code: 'FORBIDDEN', message: 'Target is already the owner' } }, 403);
       if (target.status === 'disabled') return json(res, { error: { code: 'FORBIDDEN', message: 'Cannot transfer ownership to a disabled user' } }, 403);
+      if (target.role === 'temp_user' || !target.feishu_open_id) {
+        return json(res, { error: { code: 'FORBIDDEN', message: 'Cannot transfer ownership to a temporary user' } }, 403);
+      }
       const state = crypto.randomUUID();
       const confirmToken = crypto.randomUUID();
       if (pendingTransfers.size > 10000) {
@@ -314,6 +319,17 @@ const server = http.createServer(async (req, res) => {
     }
 
     if (method === 'GET' && path === '/api/v1/auth/feishu/authorize') {
+      // Per-IP throttle: this endpoint mints states into the shared map.
+      const authIp = (req.socket.remoteAddress || req.headers['x-forwarded-for'] || 'unknown').toString().split(',')[0].trim();
+      const authNow = Date.now();
+      const authBucket = authorizeBuckets.get(authIp);
+      if (!authBucket || authBucket.resetAt < authNow) {
+        authorizeBuckets.set(authIp, { count: 1, resetAt: authNow + 60000 });
+      } else if (authBucket.count >= 60) {
+        return json(res, { error: { code: 'TOO_MANY_REQUESTS', message: 'Too many authorization requests, try again later' } }, 429);
+      } else {
+        authBucket.count += 1;
+      }
       const state = crypto.randomUUID();
       const redirect = url.searchParams.get('redirect');
       // Evict expired entries before the bound check so a burst of stale states
