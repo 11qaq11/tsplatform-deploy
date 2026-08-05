@@ -29,18 +29,19 @@ db.exec(`
     username TEXT,
     email TEXT,
     avatar_url TEXT,
-    role TEXT DEFAULT 'user' CHECK(role IN ('user','admin','owner')),
+    role TEXT DEFAULT 'user' CHECK(role IN ('user','admin','owner','temp_user')),
     status TEXT DEFAULT 'active' CHECK(status IN ('active','disabled')),
     created_at TEXT DEFAULT (datetime('now')),
     last_login_at TEXT DEFAULT (datetime('now')),
     session_token TEXT,
-    session_expires_at TEXT
+    session_expires_at TEXT,
+    user_no INTEGER DEFAULT 0
   );
 `);
 
-// Migrate legacy users table whose role CHECK lacks 'owner' by rebuilding it.
+// Migrate legacy users table (missing owner/temp_user role or user_no) by rebuilding it.
 const usersTableSql = db.prepare("SELECT sql FROM sqlite_master WHERE type='table' AND name='users'").get();
-if (usersTableSql && !/owner/.test(usersTableSql.sql)) {
+if (usersTableSql && (!/owner/.test(usersTableSql.sql) || !/temp_user/.test(usersTableSql.sql) || !/user_no/.test(usersTableSql.sql))) {
   db.exec(`
     ALTER TABLE users RENAME TO users_old;
     CREATE TABLE users (
@@ -50,14 +51,18 @@ if (usersTableSql && !/owner/.test(usersTableSql.sql)) {
       username TEXT,
       email TEXT,
       avatar_url TEXT,
-      role TEXT DEFAULT 'user' CHECK(role IN ('user','admin','owner')),
+      role TEXT DEFAULT 'user' CHECK(role IN ('user','admin','owner','temp_user')),
       status TEXT DEFAULT 'active' CHECK(status IN ('active','disabled')),
       created_at TEXT DEFAULT (datetime('now')),
       last_login_at TEXT DEFAULT (datetime('now')),
       session_token TEXT,
-      session_expires_at TEXT
+      session_expires_at TEXT,
+      user_no INTEGER DEFAULT 0
     );
-    INSERT INTO users SELECT id,feishu_open_id,feishu_union_id,username,email,avatar_url,role,status,created_at,last_login_at,session_token,session_expires_at FROM users_old;
+    INSERT INTO users (id,feishu_open_id,feishu_union_id,username,email,avatar_url,role,status,created_at,last_login_at,session_token,session_expires_at,user_no)
+    SELECT id,feishu_open_id,feishu_union_id,username,email,avatar_url,role,status,created_at,last_login_at,session_token,session_expires_at,
+           ROW_NUMBER() OVER (ORDER BY created_at, id) AS user_no
+    FROM users_old;
     DROP TABLE users_old;
   `);
 }
@@ -309,15 +314,19 @@ const server = http.createServer(async (req, res) => {
     if (method === 'GET' && path === '/api/v1/auth/feishu/authorize') {
       const state = crypto.randomUUID();
       const redirect = url.searchParams.get('redirect');
+      // Bound the anonymous state map to prevent memory exhaustion.
+      if (pendingSessions.size > 10000) {
+        return json(res, { error: { code: 'TOO_MANY_REQUESTS', message: 'Too many authorization requests, try again later' } }, 429);
+      }
+      // Always register the state (desktop login has no redirect; the callback
+      // validates against this map and the desktop app polls session/wait).
       if (redirect) {
-        // Bound the anonymous state map to prevent memory exhaustion.
-        if (pendingSessions.size > 10000) {
-          return json(res, { error: { code: 'TOO_MANY_REQUESTS', message: 'Too many authorization requests, try again later' } }, 429);
-        }
         let allowed = false;
         try { allowed = new URL(redirect).origin === ADMIN_PANEL_ORIGIN; } catch { allowed = false; }
         if (!allowed) return json(res, { error: { code: 'VALIDATION_ERROR', message: 'Invalid redirect' } }, 400);
         pendingSessions.set(state, { redirect, created: Date.now() });
+      } else {
+        pendingSessions.set(state, { created: Date.now() });
       }
       const p = new URLSearchParams({ app_id: FEISHU_APP_ID, redirect_uri: FEISHU_REDIRECT_URI, state,  });
       return json(res, { redirect_url: `https://open.feishu.cn/open-apis/authen/v1/index?${p}`, state });
@@ -389,7 +398,8 @@ const server = http.createServer(async (req, res) => {
           const id = crypto.randomUUID();
           const ownerCount = db.prepare("SELECT COUNT(*) c FROM users WHERE role='owner'").get().c;
           const role = isOwner && ownerCount === 0 ? 'owner' : (isAdmin ? 'admin' : 'user');
-          db.prepare('INSERT INTO users (id,feishu_open_id,feishu_union_id,username,email,avatar_url,session_token,session_expires_at,role) VALUES (?,?,?,?,?,?,?,?,?)').run(id, open_id, union_id, name, email || null, avatar_url || null, token, exp, role);
+          const userNo = db.prepare('SELECT COALESCE(MAX(user_no),0)+1 AS n FROM users').get().n;
+          db.prepare('INSERT INTO users (id,feishu_open_id,feishu_union_id,username,email,avatar_url,session_token,session_expires_at,role,user_no) VALUES (?,?,?,?,?,?,?,?,?,?)').run(id, open_id, union_id, name, email || null, avatar_url || null, token, exp, role, userNo);
           user = db.prepare('SELECT * FROM users WHERE id=?').get(id);
         }
 
@@ -435,7 +445,23 @@ const server = http.createServer(async (req, res) => {
     if (method === 'GET' && path === '/api/v1/auth/session') {
       const u = auth(req);
       if (!u) return json(res, { error: { code: 'UNAUTHORIZED' } }, 401);
-      return json(res, { user: { id: u.id, username: u.username, email: u.email, role: u.role } });
+      return json(res, { user: { id: u.id, username: u.username, email: u.email, role: u.role, user_no: u.user_no } });
+    }
+
+    // POST /auth/temp-register — cloud-side temporary user registration
+    // (desktop "temporary login"; appears in admin user management).
+    if (method === 'POST' && path === '/api/v1/auth/temp-register') {
+      const body = await parseBody(req);
+      if (body.__too_large) return json(res, { error: { code: 'PAYLOAD_TOO_LARGE', message: 'Request body too large' } }, 413);
+      const username = typeof body.username === 'string' ? body.username.trim() : '';
+      if (!username) return json(res, { error: { code: 'VALIDATION_ERROR', message: 'username is required' } }, 400);
+      if (username.length > 32) return json(res, { error: { code: 'VALIDATION_ERROR', message: 'username must be at most 32 characters' } }, 400);
+      const id = `temp_${crypto.randomUUID().replace(/-/g, '').slice(0, 12)}`;
+      const token = crypto.randomUUID();
+      const exp = new Date(Date.now() + 7 * 86400000).toISOString();
+      const userNo = db.prepare('SELECT COALESCE(MAX(user_no),0)+1 AS n FROM users').get().n;
+      db.prepare("INSERT INTO users (id,feishu_open_id,feishu_union_id,username,role,status,session_token,session_expires_at,user_no) VALUES (?,NULL,NULL,?, 'temp_user','active',?,?,?)").run(id, username, token, exp, userNo);
+      return json(res, { session_token: token, expires_at: exp, user: { id, username, email: null, avatar_url: null, role: 'temp_user', user_no: userNo } });
     }
 
     if (method === 'POST' && path === '/api/v1/auth/logout') {
@@ -650,7 +676,7 @@ const server = http.createServer(async (req, res) => {
         where += ' AND (username LIKE ? OR email LIKE ?)';
         params.push(`%${search.trim()}%`, `%${search.trim()}%`);
       }
-      const items = db.prepare(`SELECT id,username,email,role,status,created_at,last_login_at FROM users ${where} ORDER BY created_at DESC LIMIT ? OFFSET ?`).all(...params, limit, offset);
+      const items = db.prepare(`SELECT id,username,email,role,status,user_no,created_at,last_login_at FROM users ${where} ORDER BY CASE role WHEN 'owner' THEN 0 WHEN 'admin' THEN 1 WHEN 'user' THEN 2 ELSE 3 END, user_no ASC LIMIT ? OFFSET ?`).all(...params, limit, offset);
       const total = db.prepare(`SELECT COUNT(*) c FROM users ${where}`).get(...params).c;
       return json(res, { items, total, page, limit });
     }
